@@ -1,5 +1,6 @@
 import json
 import random
+import threading
 from requests.models import Response
 from localstack import config
 from localstack.utils.common import to_str
@@ -18,6 +19,8 @@ ACTION_UPDATE_SHARD_COUNT = '%s.UpdateShardCount' % ACTION_PREFIX
 
 
 class ProxyListenerKinesis(ProxyListener):
+    def __init__(self):
+        self.lock = threading.Lock()
 
     def forward_request(self, method, path, data, headers):
         data = json.loads(to_str(data))
@@ -64,7 +67,11 @@ class ProxyListenerKinesis(ProxyListener):
             }
             event_records = [event_record]
             stream_name = data['StreamName']
-            lambda_api.process_kinesis_records(event_records, stream_name)
+            await self.lock.acquire()  # noqa: E999
+            try:
+                lambda_api.process_kinesis_records(event_records, stream_name)
+            finally:
+                self.lock.release()
         elif action == ACTION_PUT_RECORDS:
             event_records = []
             response_body = json.loads(to_str(response.content))
@@ -80,7 +87,11 @@ class ProxyListenerKinesis(ProxyListener):
                     }
                     event_records.append(event_record)
                 stream_name = data['StreamName']
-                lambda_api.process_kinesis_records(event_records, stream_name)
+                await self.lock.acquire()
+                try:
+                    lambda_api.process_kinesis_records(event_records, stream_name)
+                finally:
+                    self.lock.release()
         elif action == ACTION_UPDATE_SHARD_COUNT:
             # Currently kinesalite, which backs the Kinesis implementation for localstack, does
             # not support UpdateShardCount:
