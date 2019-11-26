@@ -18,7 +18,7 @@ from localstack.services.generic_proxy import ProxyListener
 from localstack.utils.aws.aws_responses import flask_to_requests_response, requests_response
 from localstack.services.apigateway.helpers import (get_resource_for_path,
     handle_authorizers, extract_query_string_params,
-    extract_path_params, make_error, get_cors_response)
+    extract_path_params, make_error_response, get_cors_response)
 
 # set up logger
 LOGGER = logging.getLogger(__name__)
@@ -35,7 +35,6 @@ GATEWAY_RESPONSES = {}
 class ProxyListenerApiGateway(ProxyListener):
 
     def forward_request(self, method, path, data, headers):
-        data = data and json.loads(to_str(data))
 
         if re.match(PATH_REGEX_USER_REQUEST, path):
             search_match = re.search(PATH_REGEX_USER_REQUEST, path)
@@ -43,6 +42,8 @@ class ProxyListenerApiGateway(ProxyListener):
             stage = search_match.group(2)
             relative_path_w_query_params = '/%s' % search_match.group(3)
             return invoke_rest_api(api_id, stage, method, relative_path_w_query_params, data, headers, path=path)
+
+        data = data and json.loads(to_str(data))
 
         if re.match(PATH_REGEX_AUTHORIZERS, path):
             return handle_authorizers(method, path, data, headers)
@@ -142,7 +143,7 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
     try:
         extracted_path, resource = get_resource_for_path(path=relative_path, path_map=path_map)
     except Exception:
-        return make_error('Unable to find path %s' % path, 404)
+        return make_error_response('Unable to find path %s' % path, 404)
 
     integrations = resource.get('resourceMethods', {})
     integration = integrations.get(method, {})
@@ -153,7 +154,7 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
         if method == 'OPTIONS' and 'Origin' in headers:
             # default to returning CORS headers if this is an OPTIONS request
             return get_cors_response(headers)
-        return make_error('Unable to find integration for path %s' % path, 404)
+        return make_error_response('Unable to find integration for path %s' % path, 404)
 
     uri = integration.get('uri')
     if integration['type'] == 'AWS':
@@ -187,7 +188,7 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
 
         msg = 'API Gateway AWS integration action URI "%s", method "%s" not yet implemented' % (uri, method)
         LOGGER.warning(msg)
-        return make_error(msg, 404)
+        return make_error_response(msg, 404)
 
     elif integration['type'] == 'AWS_PROXY':
         if uri.startswith('arn:aws:apigateway:') and ':lambda:path' in uri:
@@ -243,7 +244,7 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
         else:
             msg = 'API Gateway action uri "%s" not yet implemented' % uri
             LOGGER.warning(msg)
-            return make_error(msg, 404)
+            return make_error_response(msg, 404)
 
     elif integration['type'] == 'HTTP':
         function = getattr(requests, method.lower())
@@ -256,7 +257,7 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
         msg = ('API Gateway integration type "%s" for method "%s" not yet implemented' %
                (integration['type'], method))
         LOGGER.warning(msg)
-        return make_error(msg, 404)
+        return make_error_response(msg, 404)
 
     return 200
 

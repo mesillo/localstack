@@ -4,13 +4,15 @@ import base64
 import re
 import json
 import unittest
+from jsonpatch import apply_patch
 from requests.models import Response
 from xml.dom.minidom import parseString
+from requests.structures import CaseInsensitiveDict
 from localstack.config import INBOUND_GATEWAY_URL_PATTERN, DEFAULT_REGION
 from localstack.constants import TEST_AWS_ACCOUNT_ID
 from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
-from localstack.utils.common import to_str, load_file
+from localstack.utils.common import to_str, load_file, json_safe, clone
 from localstack.utils.common import safe_requests as requests
 from localstack.services.generic_proxy import GenericProxy, ProxyListener
 from localstack.services.awslambda.lambda_api import (
@@ -58,7 +60,31 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
     TEST_LAMBDA_PROXY_BACKEND_WITH_PATH_PARAM = 'test_lambda_apigw_backend_path_param'
     TEST_LAMBDA_PROXY_BACKEND_ANY_METHOD = 'test_ARMlambda_apigw_backend_any_method'
     TEST_LAMBDA_PROXY_BACKEND_ANY_METHOD_WITH_PATH_PARAM = 'test_ARMlambda_apigw_backend_any_method_path_param'
-    TEST_LAMBDA_HANDLER_NAME = 'lambda_sqs_handler'
+    TEST_LAMBDA_SQS_HANDLER_NAME = 'lambda_sqs_handler'
+    TEST_LAMBDA_AUTHORIZER_HANDLER_NAME = 'lambda_authorizer_handler'
+    TEST_API_GATEWAY_ID = 'fugvjdxtri'
+
+    TEST_API_GATEWAY_AUTHORIZER = {
+        'name': 'test',
+        'type': 'TOKEN',
+        'providerARNs': [
+            'arn:aws:cognito-idp:us-east-1:123412341234:userpool/us-east-1_123412341'
+        ],
+        'authType': 'custom',
+        'authorizerUri': 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/' +
+                         'arn:aws:lambda:us-east-1:123456789012:function:myApiAuthorizer/invocations',
+        'authorizerCredentials': 'arn:aws:iam::123456789012:role/apigAwsProxyRole',
+        'identitySource': 'method.request.header.Authorization',
+        'identityValidationExpression': '.*',
+        'authorizerResultTtlInSeconds': 300
+    }
+    TEST_API_GATEWAY_AUTHORIZER_OPS = [
+        {
+            'op': 'replace',
+            'path': '/name',
+            'value': 'test1'
+        }
+    ]
 
     def test_api_gateway_kinesis_integration(self):
         # create target Kinesis stream
@@ -106,9 +132,9 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
             queue_arn=self.TEST_SQS_QUEUE, path=self.API_PATH_DATA_INBOUND)
 
         # create event source for sqs lambda processor
-        self.create_lambda_function(self.TEST_LAMBDA_HANDLER_NAME)
+        self.create_lambda_function(self.TEST_LAMBDA_SQS_HANDLER_NAME)
         add_event_source(
-            self.TEST_LAMBDA_HANDLER_NAME,
+            self.TEST_LAMBDA_SQS_HANDLER_NAME,
             aws_stack.sqs_queue_arn(self.TEST_SQS_QUEUE),
             True)
 
@@ -165,7 +191,11 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
             def forward_request(self, **kwargs):
                 response = Response()
                 response.status_code = 200
-                response._content = kwargs.get('data') or '{}'
+                result = {
+                    'data': kwargs.get('data') or '{}',
+                    'headers': dict(kwargs.get('headers'))
+                }
+                response._content = json.dumps(json_safe(result))
                 return response
 
         proxy = GenericProxy(test_port, update_listener=TestListener())
@@ -191,15 +221,26 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
         self.assertTrue(re.match(result.headers['Access-Control-Allow-Origin'].replace('*', '.*'), origin))
         self.assertIn('POST', result.headers['Access-Control-Allow-Methods'])
 
-        # make test request to gateway
+        # make test GET request to gateway
         result = requests.get(url)
         self.assertEqual(result.status_code, 200)
-        self.assertEqual(to_str(result.content), '{}')
+        self.assertEqual(json.loads(to_str(result.content))['data'], '{}')
 
-        data = {'data': 123}
-        result = requests.post(url, data=json.dumps(data))
+        # make test POST request to gateway
+        data = json.dumps({'data': 123})
+        result = requests.post(url, data=data)
         self.assertEqual(result.status_code, 200)
-        self.assertEqual(json.loads(to_str(result.content)), data)
+        self.assertEqual(json.loads(to_str(result.content))['data'], data)
+
+        # make test POST request with non-JSON content type
+        data = 'test=123'
+        ctype = 'application/x-www-form-urlencoded'
+        result = requests.post(url, data=data, headers={'content-type': ctype})
+        self.assertEqual(result.status_code, 200)
+        content = json.loads(to_str(result.content))
+        headers = CaseInsensitiveDict(content['headers'])
+        self.assertEqual(content['data'], data)
+        self.assertEqual(headers['content-type'], ctype)
 
         # clean up
         proxy.stop()
@@ -276,6 +317,54 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
         self._test_api_gateway_lambda_proxy_integration_any_method(
             self.TEST_LAMBDA_PROXY_BACKEND_ANY_METHOD_WITH_PATH_PARAM,
             self.API_PATH_LAMBDA_PROXY_BACKEND_ANY_METHOD_WITH_PATH_PARAM)
+
+    def test_api_gateway_authorizer_crud(self):
+
+        apig = aws_stack.connect_to_service('apigateway')
+
+        authorizer = apig.create_authorizer(
+            restApiId=self.TEST_API_GATEWAY_ID,
+            **self.TEST_API_GATEWAY_AUTHORIZER)
+
+        authorizer_id = authorizer.get('id')
+
+        create_result = apig.get_authorizer(
+            restApiId=self.TEST_API_GATEWAY_ID,
+            authorizerId=authorizer_id)
+
+        # ignore boto3 stuff
+        del create_result['ResponseMetadata']
+
+        create_expected = clone(self.TEST_API_GATEWAY_AUTHORIZER)
+        create_expected['id'] = authorizer_id
+
+        self.assertDictEqual(create_expected, create_result)
+
+        apig.update_authorizer(
+            restApiId=self.TEST_API_GATEWAY_ID,
+            authorizerId=authorizer_id,
+            patchOperations=self.TEST_API_GATEWAY_AUTHORIZER_OPS)
+
+        update_result = apig.get_authorizer(
+            restApiId=self.TEST_API_GATEWAY_ID,
+            authorizerId=authorizer_id)
+
+        # ignore boto3 stuff
+        del update_result['ResponseMetadata']
+
+        update_expected = apply_patch(create_expected, self.TEST_API_GATEWAY_AUTHORIZER_OPS)
+
+        self.assertDictEqual(update_expected, update_result)
+
+        apig.delete_authorizer(
+            restApiId=self.TEST_API_GATEWAY_ID,
+            authorizerId=authorizer_id)
+
+        self.assertRaises(
+            Exception,
+            apig.get_authorizer,
+            self.TEST_API_GATEWAY_ID,
+            authorizer_id)
 
     def _test_api_gateway_lambda_proxy_integration_any_method(self, fn_name, path):
         self.create_lambda_function(fn_name)
