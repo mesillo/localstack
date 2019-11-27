@@ -67,7 +67,7 @@ class ProxyListenerKinesis(ProxyListener):
             }
             event_records = [event_record]
             stream_name = data['StreamName']
-            await self.lock.acquire()  # noqa: E999
+            self.lock.acquire()  # noqa: E999
             try:
                 lambda_api.process_kinesis_records(event_records, stream_name)
             finally:
@@ -87,7 +87,7 @@ class ProxyListenerKinesis(ProxyListener):
                     }
                     event_records.append(event_record)
                 stream_name = data['StreamName']
-                await self.lock.acquire()
+                self.lock.acquire()
                 try:
                     lambda_api.process_kinesis_records(event_records, stream_name)
                 finally:
